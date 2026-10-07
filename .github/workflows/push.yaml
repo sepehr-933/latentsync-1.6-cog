@@ -26,10 +26,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # `cog login` takes a CLI auth token from https://replicate.com/auth/token,
+      # NOT an API token (r8_…), which it rejects. Stored as the COG_TOKEN secret.
       - name: Set up Cog
         uses: replicate/setup-cog@v2.0.2
         with:
-          token: ${{ secrets.REPLICATE_API_TOKEN }}
+          token: ${{ secrets.COG_TOKEN }}
           cog-version: v0.23.0
 
       - name: Push to Replicate
