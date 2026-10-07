@@ -15,7 +15,6 @@
 import mediapipe as mp
 import cv2
 from decord import VideoReader
-from einops import rearrange
 import os
 import numpy as np
 import torch
@@ -34,7 +33,7 @@ class FVD:
         results = self.face_detector.process(image)
 
         if not results.detections:  # Face not detected
-            raise Exception("Face not detected")
+            raise RuntimeError("Face not detected")
 
         detection = results.detections[0]  # Only use the first face in the image
         bounding_box = detection.location_data.relative_bounding_box
@@ -52,9 +51,9 @@ class FVD:
 
         return image
 
-    def detect_video(self, video_path, real: bool = True):
+    def detect_video(self, video_path):
         vr = VideoReader(video_path)
-        video_frames = vr[20:36].asnumpy()  # Use one frame per second
+        video_frames = vr[20:36].asnumpy()
         vr.seek(0)  # avoid memory leak
         faces = []
         for frame in video_frames:
@@ -63,34 +62,37 @@ class FVD:
             faces.append(face)
 
         if len(faces) != 16:
-            return None
+            return RuntimeError("Insufficient consecutive frames of faces (less than 16).")
         faces = np.stack(faces, axis=0)  # (f, h, w, c)
         faces = torch.from_numpy(faces)
         return faces
 
+    def detect_videos(self, videos_dir: str):
+        videos_list = []
 
-def eval_fvd(real_videos_dir, fake_videos_dir):
+        if videos_dir.endswith(".mp4"):
+            video_faces = self.detect_video(videos_dir)
+            videos_list.append(video_faces)
+        else:
+            for file in tqdm.tqdm(os.listdir(videos_dir)):
+                if file.endswith(".mp4"):
+                    video_path = os.path.join(videos_dir, file)
+                    video_faces = self.detect_video(video_path)
+                    videos_list.append(video_faces)
+
+        videos_list = torch.stack(videos_list) / 255.0
+        return videos_list
+
+
+def eval_fvd(real_videos_dir: str, fake_videos_dir: str):
     fvd = FVD()
-    real_features_list = []
-    fake_features_list = []
-    for file in tqdm.tqdm(os.listdir(fake_videos_dir)):
-        if file.endswith(".mp4"):
-            real_video_path = os.path.join(real_videos_dir, file.replace("_out.mp4", ".mp4"))
-            fake_video_path = os.path.join(fake_videos_dir, file)
-            real_features = fvd.detect_video(real_video_path, real=True)
-            fake_features = fvd.detect_video(fake_video_path, real=False)
-            if real_features is None or fake_features is None:
-                continue
-            real_features_list.append(real_features)
-            fake_features_list.append(fake_features)
-
-    real_features = torch.stack(real_features_list) / 255.0
-    fake_features = torch.stack(fake_features_list) / 255.0
-    print(compute_our_fvd(real_features, fake_features, device="cpu"))
+    real_videos = fvd.detect_videos(real_videos_dir)
+    fake_videos = fvd.detect_videos(fake_videos_dir)
+    fvd_value = compute_our_fvd(real_videos, fake_videos, device="cpu")
+    print(f"FVD: {fvd_value:.3f}")
 
 
 if __name__ == "__main__":
-    real_videos_dir = "/mnt/bn/maliva-gen-ai-v2/chunyu.li/VoxCeleb2/segmented/cross"
-    fake_videos_dir = "/mnt/bn/maliva-gen-ai-v2/chunyu.li/VoxCeleb2/segmented/latentsync_cross"
-
+    real_videos_dir = "dir1"
+    fake_videos_dir = "dir2"
     eval_fvd(real_videos_dir, fake_videos_dir)

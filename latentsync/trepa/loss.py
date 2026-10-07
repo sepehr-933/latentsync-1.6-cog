@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from .third_party.VideoMAEv2.utils import load_videomae_model
+from ..utils.util import check_model_and_download
 
 
 class TREPALoss:
@@ -23,8 +24,10 @@ class TREPALoss:
         self,
         device="cuda",
         ckpt_path="checkpoints/auxiliary/vit_g_hybrid_pt_1200e_ssv2_ft.pth",
+        with_cp=False,
     ):
-        self.model = load_videomae_model(device, ckpt_path).eval().to(dtype=torch.float16)
+        check_model_and_download(ckpt_path)
+        self.model = load_videomae_model(device, ckpt_path, with_cp).eval().to(dtype=torch.float16)
         self.model.requires_grad_(False)
 
     def __call__(self, videos_fake, videos_real):
@@ -33,8 +36,8 @@ class TREPALoss:
         videos_fake = rearrange(videos_fake.clone(), "b c f h w -> (b f) c h w")
         videos_real = rearrange(videos_real.clone(), "b c f h w -> (b f) c h w")
 
-        videos_fake = F.interpolate(videos_fake, size=(224, 224), mode="bilinear")
-        videos_real = F.interpolate(videos_real, size=(224, 224), mode="bilinear")
+        videos_fake = F.interpolate(videos_fake, size=(224, 224), mode="bicubic")
+        videos_real = F.interpolate(videos_real, size=(224, 224), mode="bicubic")
 
         videos_fake = rearrange(videos_fake, "(b f) c h w -> b c f h w", f=num_frames)
         videos_real = rearrange(videos_real, "(b f) c h w -> b c f h w", f=num_frames)
@@ -53,10 +56,12 @@ class TREPALoss:
 
 
 if __name__ == "__main__":
+    torch.manual_seed(42)
+
     # input shape: (b, c, f, h, w)
     videos_fake = torch.randn(2, 3, 16, 256, 256, requires_grad=True).to(device="cuda", dtype=torch.float16)
     videos_real = torch.randn(2, 3, 16, 256, 256, requires_grad=True).to(device="cuda", dtype=torch.float16)
 
-    trepa_loss = TREPALoss(device="cuda")
+    trepa_loss = TREPALoss(device="cuda", with_cp=True)
     loss = trepa_loss(videos_fake, videos_real)
     print(loss)

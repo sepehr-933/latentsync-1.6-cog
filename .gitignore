@@ -39,8 +39,14 @@ wandb/
 *.jpg
 *.jpeg
 *.csv
+*.pdf
 
-!/latentsync/utils/mask.png
+# log files
+*.log
+
+!/latentsync/utils/mask*.png
 /checkpoints/
 !/assets/*
-.cog
+!/docs/*
+!/internal/*.png
+.cog/

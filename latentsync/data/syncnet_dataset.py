@@ -21,6 +21,7 @@ from ..utils.util import gather_video_paths_recursively
 from ..utils.image_processor import ImageProcessor
 from ..utils.audio import melspectrogram
 import math
+from pathlib import Path
 
 from decord import AudioReader, VideoReader, cpu
 
@@ -42,12 +43,9 @@ class SyncNetDataset(Dataset):
 
         self.audio_sample_rate = config.data.audio_sample_rate
         self.video_fps = config.data.video_fps
-        self.audio_samples_length = int(
-            config.data.audio_sample_rate // config.data.video_fps * config.data.num_frames
-        )
-        self.image_processor = ImageProcessor(resolution=config.data.resolution, mask="half")
+        self.image_processor = ImageProcessor(resolution=config.data.resolution)
         self.audio_mel_cache_dir = config.data.audio_mel_cache_dir
-        os.makedirs(self.audio_mel_cache_dir, exist_ok=True)
+        Path(self.audio_mel_cache_dir).mkdir(parents=True, exist_ok=True)
 
     def __len__(self):
         return len(self.video_paths)
@@ -70,13 +68,8 @@ class SyncNetDataset(Dataset):
 
         while True:
             wrong_start_idx = random.randint(0, total_num_frames - self.num_frames)
-            # wrong_start_idx = random.randint(
-            #     max(0, start_idx - 25), min(total_num_frames - self.num_frames, start_idx + 25)
-            # )
             if wrong_start_idx == start_idx:
                 continue
-            # if wrong_start_idx >= start_idx - self.num_frames and wrong_start_idx <= start_idx + self.num_frames:
-            #     continue
             wrong_frames_index = np.arange(wrong_start_idx, wrong_start_idx + self.num_frames, dtype=int)
             break
 
@@ -86,13 +79,9 @@ class SyncNetDataset(Dataset):
         return frames, wrong_frames, start_idx
 
     def worker_init_fn(self, worker_id):
-        # Initialize the face mesh object in each worker process,
-        # because the face mesh object cannot be called in subprocesses
         self.worker_id = worker_id
-        # setattr(self, f"image_processor_{worker_id}", ImageProcessor(self.resolution, self.mask))
 
     def __getitem__(self, idx):
-        # image_processor = getattr(self, f"image_processor_{self.worker_id}")
         while True:
             try:
                 idx = random.randint(0, len(self) - 1)
@@ -113,7 +102,7 @@ class SyncNetDataset(Dataset):
 
                 if os.path.isfile(mel_cache_path):
                     try:
-                        original_mel = torch.load(mel_cache_path)
+                        original_mel = torch.load(mel_cache_path, weights_only=True)
                     except Exception as e:
                         print(f"{type(e).__name__} - {e} - {mel_cache_path}")
                         os.remove(mel_cache_path)
@@ -136,9 +125,6 @@ class SyncNetDataset(Dataset):
                     chosen_frames = wrong_frames
 
                 chosen_frames = self.image_processor.process_images(chosen_frames)
-                # chosen_frames, _, _ = image_processor.prepare_masks_and_masked_images(
-                #     chosen_frames, affine_transform=True
-                # )
 
                 vr.seek(0)  # avoid memory leak
                 break

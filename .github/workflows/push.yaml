@@ -1,0 +1,36 @@
+# Builds this model with Cog and pushes it to r8.im/influer/latentsync-1.6.
+# Manual only (Actions tab -> "Push to Replicate" -> Run workflow), so neither a
+# push nor a pull request from a fork can trigger a build or touch the token.
+name: Push to Replicate
+
+on:
+  workflow_dispatch:
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      # The CUDA + PyTorch image is large; the stock runner's ~14 GB free disk
+      # is not enough without clearing the preinstalled toolchains.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Cog
+        uses: replicate/setup-cog@v2.0.2
+        with:
+          token: ${{ secrets.REPLICATE_API_TOKEN }}
+          cog-version: v0.23.0
+
+      - name: Push to Replicate
+        run: cog push r8.im/influer/latentsync-1.6

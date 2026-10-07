@@ -1,122 +1,117 @@
-# Prediction interface for Cog ⚙️
-# https://cog.run/python
+# Cog predictor for LatentSync 1.6 (512x512), built on ByteDance's own code.
+#
+# Differences from ByteDance's bundled predict.py, which still loads the
+# original 256px weights with configs/unet/stage2.yaml:
+#   - loads the 1.6 checkpoint (huggingface.co/ByteDance/LatentSync-1.6) with
+#     configs/unet/stage2_512.yaml, so the mouth is generated at 512x512;
+#   - builds the pipeline ONCE in setup() instead of re-loading the 5 GB UNet
+#     in a subprocess on every prediction;
+#   - gives every prediction its own output file and temp dir;
+#   - exposes inference_steps (ByteDance recommends 20-50; more = sharper).
 
-from cog import BasePredictor, Input, Path
 import os
-import time
 import subprocess
+import time
 import uuid
-import sys
 
-MODEL_CACHE = "checkpoints"
-MODEL_URL = "https://weights.replicate.delivery/default/chunyu-li/LatentSync/model.tar"
+import torch
+from accelerate.utils import set_seed
+from cog import BasePredictor, Input, Path
+from diffusers import AutoencoderKL, DDIMScheduler
+from omegaconf import OmegaConf
 
-def download_weights(url, dest):
+from latentsync.models.unet import UNet3DConditionModel
+from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
+from latentsync.utils.face_detector import FaceDetector
+from latentsync.whisper.audio2feature import Audio2Feature
+
+CONFIG_PATH = "configs/unet/stage2_512.yaml"
+HF_BASE = "https://huggingface.co/ByteDance/LatentSync-1.6/resolve/main"
+WEIGHTS = {
+    "checkpoints/latentsync_unet.pt": f"{HF_BASE}/latentsync_unet.pt",
+    "checkpoints/whisper/tiny.pt": f"{HF_BASE}/whisper/tiny.pt",
+}
+
+
+def download(url: str, dest: str) -> None:
     start = time.time()
-    print("downloading url: ", url)
-    print("downloading to: ", dest)
-    subprocess.check_call(["pget", "-xf", url, dest], close_fds=False)
-    print("downloading took: ", time.time() - start)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    print(f"downloading {url} -> {dest}")
+    subprocess.check_call(["pget", url, dest], close_fds=False)
+    print(f"downloaded in {time.time() - start:.1f}s")
+
 
 class Predictor(BasePredictor):
-    test_inputs = {
-        "video": ".",
-        "audio": ".",
-    }
-
     def setup(self) -> None:
-        """Load the model into memory to make running multiple predictions efficient"""
-        # Download the model weights
-        if not os.path.exists(MODEL_CACHE):
-            download_weights(MODEL_URL, MODEL_CACHE)
+        for dest, url in WEIGHTS.items():
+            if not os.path.exists(dest):
+                download(url, dest)
 
-        # Soft links for the auxiliary models
-        os.system("mkdir -p ~/.cache/torch/hub/checkpoints")
-        os.system("ln -s $(pwd)/checkpoints/auxiliary/2DFAN4-cd938726ad.zip ~/.cache/torch/hub/checkpoints/2DFAN4-cd938726ad.zip")
-        os.system("ln -s $(pwd)/checkpoints/auxiliary/s3fd-619a316812.pth ~/.cache/torch/hub/checkpoints/s3fd-619a316812.pth")
-        os.system("ln -s $(pwd)/checkpoints/auxiliary/vgg16-397923af.pth ~/.cache/torch/hub/checkpoints/vgg16-397923af.pth")
+        self.config = OmegaConf.load(CONFIG_PATH)
+        fp16 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] > 7
+        self.dtype = torch.float16 if fp16 else torch.float32
+
+        audio_encoder = Audio2Feature(
+            model_path="checkpoints/whisper/tiny.pt",
+            device="cuda",
+            num_frames=self.config.data.num_frames,
+            audio_feat_length=self.config.data.audio_feat_length,
+        )
+        vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", torch_dtype=self.dtype)
+        vae.config.scaling_factor = 0.18215
+        vae.config.shift_factor = 0
+        unet, _ = UNet3DConditionModel.from_pretrained(
+            OmegaConf.to_container(self.config.model),
+            "checkpoints/latentsync_unet.pt",
+            device="cpu",
+        )
+        unet = unet.to(dtype=self.dtype)
+        self.pipeline = LipsyncPipeline(
+            vae=vae,
+            audio_encoder=audio_encoder,
+            unet=unet,
+            scheduler=DDIMScheduler.from_pretrained("configs"),
+        ).to("cuda")
+
+        # Fetch InsightFace's detector models now (into checkpoints/auxiliary)
+        # so the first prediction does not pay for the download.
+        FaceDetector(device="cuda")
 
     def predict(
         self,
-        video: Path = Input(
-            description="Input video", default=None
-        ),
-        audio: Path = Input(
-            description="Input audio to ", default=None
-        ),
+        video: Path = Input(description="Input video (the face to lip-sync)"),
+        audio: Path = Input(description="Input audio (the speech to lip-sync to)"),
         guidance_scale: float = Input(
-            description="Guidance scale", ge=0, le=10, default=1.0
+            description="Higher = tighter lip-sync, but may add distortion or jitter",
+            ge=1.0,
+            le=3.0,
+            default=1.5,
         ),
-        seed: int = Input(
-            description="Set to 0 for Random seed", default=0
-        )
+        inference_steps: int = Input(
+            description="Denoising steps. Higher = sharper, slower", ge=10, le=50, default=20
+        ),
+        seed: int = Input(description="Set to 0 for a random seed", default=0),
     ) -> Path:
-        """Run a single prediction on the model"""
-        # Generate a unique ID for this prediction run
-        run_id = str(uuid.uuid4())[:8]
-
         if seed <= 0:
             seed = int.from_bytes(os.urandom(2), "big")
         print(f"Using seed: {seed}")
+        set_seed(seed)
 
-        video_path = str(video)
-        audio_path = str(audio)
-        config_path = "configs/unet/second_stage.yaml"
-        ckpt_path = "checkpoints/latentsync_unet.pt"
-
-        # Use a unique output path for each prediction
-        unique_output_path = f"/tmp/output-{run_id}.mp4"
-
-        # Check video before processing - simple test to verify it's a valid video
-        try:
-            test_cmd = ["ffprobe", "-v", "error", "-show_entries", "stream=width,height", "-of", "csv=p=0", video_path]
-            video_info = subprocess.run(test_cmd, capture_output=True, text=True, check=True)
-            print(f"Video info: {video_info.stdout.strip()}")
-        except subprocess.CalledProcessError:
-            raise ValueError(f"Invalid or corrupted video file: {video_path}")
-
-        # Use subprocess.run instead of os.system for better isolation
-        command = [
-            "python", "-m", "scripts.inference",
-            "--unet_config_path", config_path,
-            "--inference_ckpt_path", ckpt_path,
-            "--guidance_scale", str(guidance_scale),
-            "--video_path", video_path,
-            "--audio_path", audio_path,
-            "--video_out_path", unique_output_path,
-            "--seed", str(seed)
-        ]
-
-        try:
-            # Run the process and capture output
-            process = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=True,  # Raise exception on non-zero exit
-                env=os.environ.copy(),
-            )
-            # Print stdout and stderr for debugging
-            print(process.stdout)
-            if process.stderr:
-                print(f"STDERR: {process.stderr}", file=sys.stderr)
-                
-        except subprocess.CalledProcessError as e:
-            print(f"Command failed with exit code {e.returncode}")
-            print(f"STDOUT: {e.stdout}")
-            print(f"STDERR: {e.stderr}", file=sys.stderr)
-            raise Exception(f"Lipsync generation failed: {e}")
-        except Exception as e:
-            print(f"An unexpected error occurred: {str(e)}")
-            raise
-        
-
-        # Verify output file exists
-        if not os.path.exists(unique_output_path):
-            raise Exception(f"Output file was not created: {unique_output_path}")
-            
-        # Optionally check file size to ensure it's not empty
-        if os.path.getsize(unique_output_path) == 0:
-            raise Exception(f"Output file is empty: {unique_output_path}")
-
-        return Path(unique_output_path)
+        run_id = uuid.uuid4().hex[:8]
+        out_path = f"/tmp/output-{run_id}.mp4"
+        self.pipeline(
+            video_path=str(video),
+            audio_path=str(audio),
+            video_out_path=out_path,
+            num_frames=self.config.data.num_frames,
+            num_inference_steps=inference_steps,
+            guidance_scale=guidance_scale,
+            weight_dtype=self.dtype,
+            width=self.config.data.resolution,
+            height=self.config.data.resolution,
+            mask_image_path=self.config.data.mask_image_path,
+            temp_dir=f"/tmp/latentsync-{run_id}",
+        )
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            raise RuntimeError("LatentSync produced no output video.")
+        return Path(out_path)

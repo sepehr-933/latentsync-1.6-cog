@@ -1,0 +1,8 @@
+.git
+.github
+assets
+docs
+eval
+checkpoints
+*.mp4
+*.wav
